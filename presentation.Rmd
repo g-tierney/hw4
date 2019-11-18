@@ -1,0 +1,147 @@
+---
+title: "Sportsball: Hierarchical Models to Predict NFL Games"
+author: "Graham Tierney"
+date: "11/15/2019"
+output: beamer_presentation
+header-includes:
+   - \usepackage{booktabs}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+require(tidyverse)
+
+season <- read_csv("data/season18_post.csv")
+season <- season %>% 
+  select(home_team,away_team,home_score,away_score,week,season) %>% 
+  filter(home_team != "NPR") %>% 
+  mutate(differential = home_score - away_score,
+         post = ifelse(week == 18,1,0)) %>% 
+  mutate_at(vars(ends_with("team")),function(v) case_when(v == "SD" ~ "LAC",
+                                                          v == "STL" ~ "LA",
+                                                          v == "JAC" ~ "JAX",
+                                                          TRUE ~ v))
+
+teams <- nflscrapR::nflteams$abbr %>% {. [.%in% c(season$home_team,season$away_team)]} %>% sort
+
+#OLS 
+gamemat <- apply(season,1,function(g){
+  teams_in_game <- rep(0,length(teams))
+  home <- g["home_team"]
+  teams_in_game[which(teams == g["home_team"])] <- 1
+  teams_in_game[which(teams == g["away_team"])] <- -1
+  teams_in_game
+}) %>% t
+
+gamemat <- gamemat %>% 
+  (function(d){
+    colnames(d) <- teams
+    d
+  }) %>% 
+  as_tibble()
+
+lin.mod <- lm(season$differential ~ . ,data = gamemat %>% select(-TEN)) 
+std.coef <- c(lin.mod$coefficients,"TEN" = 0)[teams] %>% {.-mean(.)}
+lin.mod %>% summary
+
+#JAGS
+jags.output <- readRDS("output/jags.output.rds")
+
+```
+
+## The Problem
+
+- In many professional sports leagues, teams do not play every other team in the league. But fans want to know what would have happened had the teams been scheduled to play. This is especially true in close playoff games where the winning team goes on to lose in the next round. 
+- I will build a tool using hierarchical models to predict the outcome of NFL games that were never played. 
+
+## Role of Hierarchical Models
+
+- In the NFL, teams only play 16 to 20 games (small sample size). 
+- The outcome of a game is determined by the \textit{difference} in skill. The winning team could be very good and the losing team merely average or the losing team could be very bad and the winning team merely average. 
+
+## Model
+
+$Y_{tg}$ is the score of team $t$ in game $g$. Modeling the joint distribution of both home and away scores is hard. $Y_{tg}>0$, and often close to 0. The correlation structure is complicated as well. But, if all you care about is predicting the winner, the \textit{score differential} has a more plausible model. 
+
+## Model 
+
+The home score differential (home team $h$ score minus away team $a$ score) for game $g$ is modeled as:
+
+\[Y_{hg} - Y_{ag} \sim N(\beta_0 + \mu_h - \mu_a,\sigma^2)\]
+\[\mu_t \sim N(\mu_0,\tau^2)\]
+
+The likelihood is not identified here (adding $c$ to all $\mu_t$ parameters won't change the likelihood). So I impose the constraint that $\sum_t \mu_t = 0$ and set $\mu_0 = 0$. Diffuse inverse gamma priors are placed on $\tau^2$ and $\sigma^2$. 
+
+## OLS (no shrinkage) and Bayesian Results
+
+```{r cars, echo = TRUE,echo=F,results='asis'}
+data.frame(Team = teams,"Bayes" = jags.output$BUGSoutput$mean$mu,"OLS" = std.coef %>% as.vector()) %>% 
+  mutate_if(is.numeric,round,digits=2) %>% 
+  arrange(-OLS) %>% {cbind(.[1:16,],.[17:32,])} %>% 
+  xtable::xtable(align = "llcc|lcc") %>% xtable::print.xtable(comment = F,include.rownames = F,size = "small")
+```
+
+## How would playoff teams have fared against eachother? 
+
+```{r pressure,echo=F,results='asis',include=F}
+# Team 1 | Team 2 | mu1 | mu2 | P(Team 1 Wins) | CI
+predict_outcome <- function(team1,team2,jags.results = jags.output,team_names = teams){
+  team1_num <- which(team_names == team1)
+  team2_num <- which(team_names == team2)
+
+  mu1 <- jags.results$BUGSoutput$mean$mu[team1_num]
+  mu2 <- jags.results$BUGSoutput$mean$mu[team2_num]
+  sigma <- jags.results$BUGSoutput$mean$sigma
+  
+  #prob_mean <- 1-pnorm(0,mu1 - mu2,sigma)
+  
+  mean_samples <- jags.results$BUGSoutput$sims.matrix[,str_c("mu[",team1_num,"]")]  - jags.results$BUGSoutput$sims.matrix[,str_c("mu[",team2_num,"]")]
+  sd_samples <- jags.results$BUGSoutput$sims.matrix[,"sigma"]
+  prob_samples <- 1-pnorm(0,mean_samples,sd_samples)
+  
+  prob_mean <- prob_samples %>% mean()
+  prob_ci <- prob_samples %>% quantile(probs = c(.025,.975)) %>% 
+    str_sub(1,4) %>% 
+    {str_c("(",.[1],",",.[2],")")}
+  
+  data.frame(team1,team2,mu1,mu2,prob_mean,prob_ci)
+}
+#predict_outcome("LA","NO")
+
+playoff_teams <- c("KC","LA","NE","NO","ARI")
+playoff_grid <- expand.grid(team1=playoff_teams,team2=playoff_teams,stringsAsFactors = F) %>% 
+  data.frame() %>% filter(team1 > team2)
+
+results <- apply(playoff_grid,1,function(g) predict_outcome(g[1],g[2])) %>% do.call(what = "rbind")
+
+results %>% 
+  xtable::xtable(digits = 2,align = "ccccccc") %>% 
+  xtable::print.xtable(comment = F,include.rownames = F)
+```
+\begin{table}[ht]
+\centering
+\begin{tabular}{cccccc}
+  \hline
+Team 1 & Team 2 & $\mu_1$ & $\mu_2$ & P(Team 1 Wins) & 95\% CI \\ 
+  \hline
+  LA & KC & 5.66 & 6.12 & 0.49 & (0.26,0.68) \\ 
+  NE & KC & 5.47 & 6.12 & 0.48 & (0.27,0.68) \\ 
+  NO & KC & 6.26 & 6.12 & 0.50 & (0.29,0.71) \\ 
+  NE & LA & 5.47 & 5.66 & 0.49 & (0.27,0.70) \\ 
+  NO & LA & 6.26 & 5.66 & 0.52 & (0.31,0.72) \\ 
+  NO & NE & 6.26 & 5.47 & 0.52 & (0.31,0.73) \\ 
+  \midrule
+  KC & ARI & 6.12 & -8.18 & 0.86 & (0.70,0.96) \\ 
+  LA & ARI & 5.66 & -8.18 & 0.85 & (0.69,0.95) \\ 
+  NE & ARI & 5.47 & -8.18 & 0.85 & (0.69,0.96) \\ 
+  NO & ARI & 6.26 & -8.18 & 0.86 & (0.69,0.96) \\ 
+   \hline
+\end{tabular}
+\end{table}
+
+## Takeaways
+
+- When predicting head-to-head comparisons, the grand mean is less important. 
+- Data augmentation can help improve model assumptions. 
+
+# Questions
